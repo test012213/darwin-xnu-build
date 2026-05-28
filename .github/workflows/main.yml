@@ -1,0 +1,21 @@
+name: Build XNU Kernel
+on: [push]
+
+jobs:
+  build:
+    runs-on: macos-14 # Uses Apple Silicon runner
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build XNU
+        run: |
+          # The runner has the full Xcode environment. 
+          # No need to fake anything.
+          ./build.sh
+          
+      - name: Upload Kernel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xnu-kernel-binary
+          path: output/ # Point to your build's output folder
