@@ -9,10 +9,14 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build XNU
+        env:
+          # This tells many scripts to skip interactive prompts
+          CI: "true"
+          DEBIAN_FRONTEND: "noninteractive"
         run: |
-          # The runner has the full Xcode environment. 
-          # No need to fake anything.
-          ./build.sh
+          # We use 'yes' or 'echo' to select the first option in the menu.
+          # If '1' is the version you want, this will feed it to the script.
+          echo "1" | ./build.sh
           
       - name: Upload Kernel Artifact
         uses: actions/upload-artifact@v4
