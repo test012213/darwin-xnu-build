@@ -1,25 +1,31 @@
 name: Build XNU Kernel
+
 on: [push]
 
 jobs:
   build:
-    runs-on: macos-14 # Uses Apple Silicon runner
+    runs-on: macos-14 # Must be macOS to have Xcode and XNU build tools
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Setup tmate session
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
+
       - name: Build XNU
         env:
-          # This tells many scripts to skip interactive prompts
           CI: "true"
           DEBIAN_FRONTEND: "noninteractive"
         run: |
-          # We use 'yes' or 'echo' to select the first option in the menu.
-          # If '1' is the version you want, this will feed it to the script.
-          echo "1" | ./build.sh
-          
+          # If ./build.sh still fails, this SSH session will stay open
+          # so you can run it manually and debug the menu
+          chmod +x build.sh
+          ./build.sh
+
       - name: Upload Kernel Artifact
         uses: actions/upload-artifact@v4
         with:
           name: xnu-kernel-binary
-          path: output/ # Point to your build's output folder
+          path: output/
