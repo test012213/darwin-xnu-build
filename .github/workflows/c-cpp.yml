@@ -1,4 +1,4 @@
-name: XNU CodeQL
+name: XNU CodeQL x86_64
 
 on:
   push:
@@ -18,97 +18,166 @@ concurrency:
 jobs:
   build:
     runs-on: macos-latest
+    timeout-minutes: 240
     strategy:
       matrix:
         macos-version: ["26.4"]
+
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
+      - name: Patch build.sh for macOS 26.4
+        run: |
+          python3 << 'PYEOF'
+          import re
+          with open('build.sh') as f:
+              content = f.read()
+          new_case = (
+              "    '26.4')\n"
+              "      RELEASE_URL='https://raw.githubusercontent.com/apple-oss-distributions/distribution-macOS/macos-264/release.json'\n"
+              "      KDK_NAME='Kernel Debug Kit 26.4 build 25E246'\n"
+              "      KDKROOT='/Library/Developer/KDKs/KDK_26.4_25E246.kdk/'\n"
+              "      RC_DARWIN_KERNEL_VERSION='25.4.0'\n"
+              "      ;;\n\n"
+          )
+          patched = re.sub(
+              r'(?m)^(\s+\*\)\s*\n\s+error \"Invalid xnu version\")',
+              new_case + r'\1',
+              content,
+              count=1
+          )
+          assert patched != content, "Patch did not apply — check build.sh structure"
+          with open('build.sh', 'w') as f:
+              f.write(patched)
+          print('build.sh patched for 26.4')
+          PYEOF
+
       - name: Deps
         run: |
-          # brew update
           brew install bash blacktop/tap/ipsw
-          # cmake brew fix TODO remove when fixed
           brew uninstall cmake || true
           brew install cmake
-          # sudo ipsw dl kdk --host --install
-          sudo xcode-select -s /Applications/Xcode_26.1.app
+          XCODE_APP=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [ -n "$XCODE_APP" ]; then
+            sudo xcode-select -s "$XCODE_APP"
+            echo "Selected Xcode: $XCODE_APP"
+          else
+            sudo xcode-select -s /Applications/Xcode_26.1.app
+            echo "Fallback: using Xcode 26.1"
+          fi
 
-      - name: kmutil help # This is to check for what flags are available
+      - name: kmutil help
         run: |
           sysctl -n kern.bootobjectspath || true
           sw_vers
           kmutil inspect
 
-      # - name: Cache JSONDB
-      #   id: cache-jsondb
-      #   uses: actions/cache@v4
-      #   with:
-      #     path: .cache/${{ matrix.macos-version }}/compile_commands.json
-      #     key: ${{ matrix.macos-version }}-jsondb
-
       - name: Build XNU JSON compilation database
         if: steps.cache-jsondb.outputs.cache-hit != 'true'
         run: |
-          MACOS_VERSION='${{ matrix.macos-version }}' MACHINE_CONFIG=VMAPPLE JSONDB=1 bash -x build.sh
-          zip -j xnu-${{ matrix.macos-version }}-jsondb.zip .cache/${{ matrix.macos-version }}/compile_commands.json
+          set -o pipefail
+          (
+            MACOS_VERSION='${{ matrix.macos-version }}' ARCH_CONFIG=X86_64 MACHINE_CONFIG=NONE JSONDB=1 bash build.sh
+          ) &> jsondb.log || (
+            echo "❌ JSONDB build failed — showing last 500 lines:"
+            tail -n 500 jsondb.log
+            exit 1
+          )
+          zip -j xnu-${{ matrix.macos-version }}-x86_64-jsondb.zip .cache/${{ matrix.macos-version }}/compile_commands.json
 
       - name: Build XNU
         run: |
-          MACOS_VERSION='${{ matrix.macos-version }}' MACHINE_CONFIG=VMAPPLE KC_FILTER='com.apple.driver.SEPHibernation|com.apple.iokit.IOACPIFamily' bash -x build.sh
-          # ipsw macho info fakeroot/oss-xnu.macOS.${{ matrix.macos-version }}.kc.vmapple
-          ls -lah fakeroot/System/Library/Kernels/
-          cp fakeroot/System/Library/Kernels/kernel.release.vmapple .
-          echo "$(shasum -a 256 kernel.release.vmapple)"
-          shasum -a 256 kernel.release.vmapple > kernel.release.vmapple.sha256
+          set -o pipefail
+          (
+            MACOS_VERSION='${{ matrix.macos-version }}' ARCH_CONFIG=X86_64 MACHINE_CONFIG=NONE bash build.sh
+          ) &> build-xnu.log || (
+            echo "❌ XNU build failed — showing last 500 lines:"
+            tail -n 500 build-xnu.log
+            exit 1
+          )
+
+          ls -lah fakeroot/System/Library/Kernels/ || true
+
+          if [ -f "fakeroot/System/Library/Kernels/kernel.release.none" ]; then
+            echo "Found kernel at fakeroot/System/Library/Kernels/kernel.release.none"
+            cp fakeroot/System/Library/Kernels/kernel.release.none .
+          elif [ -f "fakeroot/System/Library/Kernels/kernel" ]; then
+            echo "Found kernel at fakeroot/System/Library/Kernels/kernel — renaming to kernel.release.none"
+            cp fakeroot/System/Library/Kernels/kernel .
+            mv kernel kernel.release.none
+          elif [ -f "kernel" ]; then
+            echo "Found kernel at repository root — renaming to kernel.release.none"
+            mv kernel kernel.release.none
+          else
+            echo "❌ kernel.release.none not found in expected locations"
+            echo "Listing workspace root for debugging:"
+            ls -lah || true
+            echo "Showing last 500 lines of build log for context:"
+            tail -n 500 build-xnu.log || true
+            exit 1
+          fi
+
+          shasum -a 256 kernel.release.none > kernel.release.none.sha256
+          echo "Kernel checksum:"
+          cat kernel.release.none.sha256
 
       - name: Build XNU library
         run: |
-          MACOS_VERSION='${{ matrix.macos-version }}' MACHINE_CONFIG=VMAPPLE bash -x build.sh --lib
-          tar -czf xnu-lib-${{ matrix.macos-version }}.tar.gz -C build/xnu-lib.obj libkernel.release.vmapple.a RELEASE_ARM64_VMAPPLE
-          echo "$(shasum -a 256 xnu-lib-${{ matrix.macos-version }}.tar.gz)"
-          shasum -a 256 xnu-lib-${{ matrix.macos-version }}.tar.gz > xnu-lib-${{ matrix.macos-version }}.tar.gz.sha256
+          set -o pipefail
+          (
+            MACOS_VERSION='${{ matrix.macos-version }}' ARCH_CONFIG=X86_64 MACHINE_CONFIG=NONE bash build.sh --lib
+          ) &> build-lib.log || (
+            echo "❌ Library build failed — showing last 500 lines:"
+            tail -n 500 build-lib.log
+            exit 1
+          )
+          tar -czf xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz -C build/xnu-lib.obj libkernel.release.none.a RELEASE_X86_64_NONE
+          shasum -a 256 xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz > xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz.sha256
 
-      - uses: actions/upload-artifact@v6
+      - name: Upload kernel artifact (if present)
+        if: always()
+        uses: actions/upload-artifact@v6
         with:
-          name: xnu-build-${{ matrix.macos-version }}
+          name: xnu-build-${{ matrix.macos-version }}-x86_64
           path: |
+            kernel.release.none
+            kernel.release.none.sha256
             fakeroot/System/Library/Kernels/
-            # fakeroot/oss-xnu.macOS.${{ matrix.macos-version }}.kc.vmapple
 
       - uses: actions/upload-artifact@v6
         with:
-          name: xnu-lib-${{ matrix.macos-version }}
+          name: xnu-lib-${{ matrix.macos-version }}-x86_64
           path: |
-            xnu-lib-${{ matrix.macos-version }}.tar.gz
-            xnu-lib-${{ matrix.macos-version }}.tar.gz.sha256
+            xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz
+            xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz.sha256
 
       - name: Build XNU CodeQL Database
         run: |
-          MACOS_VERSION='${{ matrix.macos-version }}' MACHINE_CONFIG=VMAPPLE bash -x codeql.sh
-          mv xnu-codeql.zip xnu-codeql-${{ matrix.macos-version }}.zip
-          echo "$(shasum -a 256 xnu-codeql-${{ matrix.macos-version }}.zip)"
-          shasum -a 256 xnu-codeql-${{ matrix.macos-version }}.zip > xnu-codeql-${{ matrix.macos-version }}.zip.sha256
+          set -o pipefail
+          (
+            MACOS_VERSION='${{ matrix.macos-version }}' ARCH_CONFIG=X86_64 MACHINE_CONFIG=NONE bash codeql.sh
+          ) &> codeql.log || (
+            echo "❌ CodeQL build failed — showing last 500 lines:"
+            tail -n 500 codeql.log
+            exit 1
+          )
+          mv xnu-codeql.zip xnu-codeql-${{ matrix.macos-version }}-x86_64.zip
+          shasum -a 256 xnu-codeql-${{ matrix.macos-version }}-x86_64.zip > xnu-codeql-${{ matrix.macos-version }}-x86_64.zip.sha256
 
       - uses: actions/upload-artifact@v6
         with:
-          name: xnu-codeql-${{ matrix.macos-version }}
+          name: xnu-codeql-${{ matrix.macos-version }}-x86_64
           path: |
-            xnu-codeql-${{ matrix.macos-version }}.zip
-            xnu-codeql-${{ matrix.macos-version }}.zip.sha256
+            xnu-codeql-${{ matrix.macos-version }}-x86_64.zip
+            xnu-codeql-${{ matrix.macos-version }}-x86_64.zip.sha256
 
-      - name: Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          ls -lah
-          gh release upload v${{ matrix.macos-version }} --clobber kernel.release.vmapple
-          gh release upload v${{ matrix.macos-version }} --clobber kernel.release.vmapple.sha256
-          gh release upload v${{ matrix.macos-version }} --clobber xnu-codeql-${{ matrix.macos-version }}.zip
-          gh release upload v${{ matrix.macos-version }} --clobber xnu-codeql-${{ matrix.macos-version }}.zip.sha256
-          gh release upload v${{ matrix.macos-version }} --clobber xnu-${{ matrix.macos-version }}-jsondb.zip
-          gh release upload v${{ matrix.macos-version }} --clobber xnu-lib-${{ matrix.macos-version }}.tar.gz
-          gh release upload v${{ matrix.macos-version }} --clobber xnu-lib-${{ matrix.macos-version }}.tar.gz.sha256
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: xnu-logs-${{ matrix.macos-version }}-x86_64
+          path: |
+            *.log
