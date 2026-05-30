@@ -101,9 +101,37 @@ jobs:
             tail -n 500 build-xnu.log
             exit 1
           )
-          ls -lah fakeroot/System/Library/Kernels/
-          cp fakeroot/System/Library/Kernels/kernel.release.none .
+
+          # Show kernel dir if present (best-effort)
+          ls -lah fakeroot/System/Library/Kernels/ || true
+
+          # Prefer the canonical path, but accept other locations:
+          # 1) fakeroot/System/Library/Kernels/kernel.release.none
+          # 2) fakeroot/System/Library/Kernels/kernel  (rename to kernel.release.none)
+          # 3) ./kernel  (rename to kernel.release.none)
+          if [ -f "fakeroot/System/Library/Kernels/kernel.release.none" ]; then
+            echo "Found kernel at fakeroot/System/Library/Kernels/kernel.release.none"
+            cp fakeroot/System/Library/Kernels/kernel.release.none .
+          elif [ -f "fakeroot/System/Library/Kernels/kernel" ]; then
+            echo "Found kernel at fakeroot/System/Library/Kernels/kernel — renaming to kernel.release.none"
+            cp fakeroot/System/Library/Kernels/kernel .
+            mv kernel kernel.release.none
+          elif [ -f "kernel" ]; then
+            echo "Found kernel at repository root — renaming to kernel.release.none"
+            mv kernel kernel.release.none
+          else
+            echo "❌ kernel.release.none not found in expected locations"
+            echo "Listing workspace root for debugging:"
+            ls -lah || true
+            echo "Showing last 500 lines of build log for context:"
+            tail -n 500 build-xnu.log || true
+            exit 1
+          fi
+
+          # Produce checksum
           shasum -a 256 kernel.release.none > kernel.release.none.sha256
+          echo "Kernel checksum:"
+          cat kernel.release.none.sha256
 
       - name: Build XNU library
         run: |
@@ -118,10 +146,15 @@ jobs:
           tar -czf xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz -C build/xnu-lib.obj libkernel.release.none.a RELEASE_X86_64_NONE
           shasum -a 256 xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz > xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz.sha256
 
-      - uses: actions/upload-artifact@v6
+      - name: Upload kernel artifact (if present)
+        if: always()
+        uses: actions/upload-artifact@v6
         with:
           name: xnu-build-${{ matrix.macos-version }}-x86_64
-          path: fakeroot/System/Library/Kernels/
+          path: |
+            kernel.release.none
+            kernel.release.none.sha256
+            fakeroot/System/Library/Kernels/
 
       - uses: actions/upload-artifact@v6
         with:
