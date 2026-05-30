@@ -1,32 +1,154 @@
-name: Build XNU Kernel
+name: XNU CodeQL x86_64
 
-on: [push]
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "*.md"
+      - Makefile
+      - .cirrus.yml
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-    runs-on: macos-14 # Must be macOS to have Xcode and XNU build tools
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        macos-version: ["26.4"]
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-     - name: Setup tmate session
-       uses: mxschmitt/action-tmate@v3
+      - name: Checkout
+        uses: actions/checkout@v6
         with:
-          # This forces tmate to generate a new key for this session
-          limit-access-to-actor: false
+          fetch-depth: 0
+
+      # build.sh only has cases up to 26.3 — patch it to add 26.4 before the
+      # catch-all *) error block.  KDK build 25E246 is the confirmed stable KDK
+      # for macOS 26.4 (Tahoe), mirrored by dortania/KdkSupportPkg.
+      - name: Patch build.sh for macOS 26.4
+        run: |
+          python3 << 'PYEOF'
+          import re
+          with open('build.sh') as f:
+              content = f.read()
+          new_case = (
+              "    '26.4')\n"
+              "      RELEASE_URL='https://raw.githubusercontent.com/apple-oss-distributions/distribution-macOS/macos-264/release.json'\n"
+              "      KDK_NAME='Kernel Debug Kit 26.4 build 25E246'\n"
+              "      KDKROOT='/Library/Developer/KDKs/KDK_26.4_25E246.kdk/'\n"
+              "      RC_DARWIN_KERNEL_VERSION='25.4.0'\n"
+              "      ;;\n\n"
+          )
+          # Match the two-line catch-all pattern in choose_xnu() and insert before it
+          patched = re.sub(
+              r'(?m)^(\s+\*\)\s*\n\s+error "Invalid xnu version")',
+              new_case + r'\1',
+              content,
+              count=1
+          )
+          assert patched != content, "Patch did not apply — check build.sh structure"
+          with open('build.sh', 'w') as f:
+              f.write(patched)
+          print('build.sh patched for 26.4')
+          PYEOF
+
+      - name: Deps
+        run: |
+          # brew update
+          brew install bash blacktop/tap/ipsw
+          # cmake brew fix TODO remove when fixed
+          brew uninstall cmake || true
+          brew install cmake
+          # Use the latest available Xcode 26.x; fall back to 26.1 if needed
+          XCODE_APP=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [ -n "$XCODE_APP" ]; then
+            sudo xcode-select -s "$XCODE_APP"
+            echo "Selected Xcode: $XCODE_APP"
+          else
+            sudo xcode-select -s /Applications/Xcode_26.1.app
+            echo "Fallback: using Xcode 26.1"
+          fi
+
+      - name: kmutil help # This is to check for what flags are available
+        run: |
+          sysctl -n kern.bootobjectspath || true
+          sw_vers
+          kmutil inspect
+
+      # - name: Cache JSONDB
+      #   id: cache-jsondb
+      #   uses: actions/cache@v4
+      #   with:
+      #     path: .cache/${{ matrix.macos-version }}/compile_commands.json
+      #     key: ${{ matrix.macos-version }}-x86_64-jsondb
+
+      - name: Build XNU JSON compilation database
+        if: steps.cache-jsondb.outputs.cache-hit != 'true'
+        run: |
+          MACOS_VERSION='${{ matrix.macos-version }}' ARCH_CONFIG=X86_64 MACHINE_CONFIG=NONE JSONDB=1 bash -x build.sh
+          zip -j xnu-${{ matrix.macos-version }}-x86_64-jsondb.zip .cache/${{ matrix.macos-version }}/compile_commands.json
 
       - name: Build XNU
-        env:
-          CI: "true"
-          DEBIAN_FRONTEND: "noninteractive"
         run: |
-          # If ./build.sh still fails, this SSH session will stay open
-          # so you can run it manually and debug the menu
-          chmod +x build.sh
-          ./build.sh
+          # ARCH_CONFIG=X86_64 MACHINE_CONFIG=NONE  →  kernel.release.none
+          # Cross-compilation from the ARM64 runner works because:
+          #   - Apple Clang is always a multi-target cross-compiler
+          #   - build.sh already builds mig/ctfmerge/libfirehose as fat (arm64+x86_64) binaries
+          MACOS_VERSION='${{ matrix.macos-version }}' ARCH_CONFIG=X86_64 MACHINE_CONFIG=NONE bash -x build.sh
+          ls -lah fakeroot/System/Library/Kernels/
+          cp fakeroot/System/Library/Kernels/kernel.release.none .
+          echo "$(shasum -a 256 kernel.release.none)"
+          shasum -a 256 kernel.release.none > kernel.release.none.sha256
 
-      - name: Upload Kernel Artifact
-        uses: actions/upload-artifact@v4
+      - name: Build XNU library
+        run: |
+          MACOS_VERSION='${{ matrix.macos-version }}' ARCH_CONFIG=X86_64 MACHINE_CONFIG=NONE bash -x build.sh --lib
+          # KERNEL_TYPE = release.none  →  libkernel.release.none.a  +  RELEASE_X86_64_NONE/
+          tar -czf xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz -C build/xnu-lib.obj libkernel.release.none.a RELEASE_X86_64_NONE
+          echo "$(shasum -a 256 xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz)"
+          shasum -a 256 xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz > xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v6
         with:
-          name: xnu-kernel-binary
-          path: output/
+          name: xnu-build-${{ matrix.macos-version }}-x86_64
+          path: |
+            fakeroot/System/Library/Kernels/
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: xnu-lib-${{ matrix.macos-version }}-x86_64
+          path: |
+            xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz
+            xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz.sha256
+
+      - name: Build XNU CodeQL Database
+        run: |
+          MACOS_VERSION='${{ matrix.macos-version }}' ARCH_CONFIG=X86_64 MACHINE_CONFIG=NONE bash -x codeql.sh
+          mv xnu-codeql.zip xnu-codeql-${{ matrix.macos-version }}-x86_64.zip
+          echo "$(shasum -a 256 xnu-codeql-${{ matrix.macos-version }}-x86_64.zip)"
+          shasum -a 256 xnu-codeql-${{ matrix.macos-version }}-x86_64.zip > xnu-codeql-${{ matrix.macos-version }}-x86_64.zip.sha256
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: xnu-codeql-${{ matrix.macos-version }}-x86_64
+          path: |
+            xnu-codeql-${{ matrix.macos-version }}-x86_64.zip
+            xnu-codeql-${{ matrix.macos-version }}-x86_64.zip.sha256
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -lah
+          gh release upload v${{ matrix.macos-version }} --clobber kernel.release.none
+          gh release upload v${{ matrix.macos-version }} --clobber kernel.release.none.sha256
+          gh release upload v${{ matrix.macos-version }} --clobber xnu-codeql-${{ matrix.macos-version }}-x86_64.zip
+          gh release upload v${{ matrix.macos-version }} --clobber xnu-codeql-${{ matrix.macos-version }}-x86_64.zip.sha256
+          gh release upload v${{ matrix.macos-version }} --clobber xnu-${{ matrix.macos-version }}-x86_64-jsondb.zip
+          gh release upload v${{ matrix.macos-version }} --clobber xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz
+          gh release upload v${{ matrix.macos-version }} --clobber xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz.sha256
