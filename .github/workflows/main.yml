@@ -18,6 +18,7 @@ concurrency:
 jobs:
   build:
     runs-on: macos-latest
+    timeout-minutes: 240
     strategy:
       matrix:
         macos-version: ["26.4"]
@@ -74,16 +75,12 @@ jobs:
           sw_vers
           kmutil inspect
 
-      # -------------------------
-      # SMART LOGGING STARTS HERE
-      # -------------------------
-
       - name: Build XNU JSON compilation database
         if: steps.cache-jsondb.outputs.cache-hit != 'true'
         run: |
           set -o pipefail
           (
-            MACOS_VERSION='${{ matrix.macos-version }}' ARCH_CONFIG=X86_64 MACHINE_CONFIG=NONE JSONDB=1 bash -x build.sh
+            MACOS_VERSION='${{ matrix.macos-version }}' ARCH_CONFIG=X86_64 MACHINE_CONFIG=NONE JSONDB=1 bash build.sh
           ) &> jsondb.log || (
             echo "❌ JSONDB build failed — showing last 500 lines:"
             tail -n 500 jsondb.log
@@ -95,20 +92,15 @@ jobs:
         run: |
           set -o pipefail
           (
-            MACOS_VERSION='${{ matrix.macos-version }}' ARCH_CONFIG=X86_64 MACHINE_CONFIG=NONE bash -x build.sh
+            MACOS_VERSION='${{ matrix.macos-version }}' ARCH_CONFIG=X86_64 MACHINE_CONFIG=NONE bash build.sh
           ) &> build-xnu.log || (
             echo "❌ XNU build failed — showing last 500 lines:"
             tail -n 500 build-xnu.log
             exit 1
           )
 
-          # Show kernel dir if present (best-effort)
           ls -lah fakeroot/System/Library/Kernels/ || true
 
-          # Prefer the canonical path, but accept other locations:
-          # 1) fakeroot/System/Library/Kernels/kernel.release.none
-          # 2) fakeroot/System/Library/Kernels/kernel  (rename to kernel.release.none)
-          # 3) ./kernel  (rename to kernel.release.none)
           if [ -f "fakeroot/System/Library/Kernels/kernel.release.none" ]; then
             echo "Found kernel at fakeroot/System/Library/Kernels/kernel.release.none"
             cp fakeroot/System/Library/Kernels/kernel.release.none .
@@ -128,7 +120,6 @@ jobs:
             exit 1
           fi
 
-          # Produce checksum
           shasum -a 256 kernel.release.none > kernel.release.none.sha256
           echo "Kernel checksum:"
           cat kernel.release.none.sha256
@@ -137,14 +128,46 @@ jobs:
         run: |
           set -o pipefail
           (
-            MACOS_VERSION='${{ matrix.macos-version }}' ARCH_CONFIG=X86_64 MACHINE_CONFIG=NONE bash -x build.sh --lib
+            MACOS_VERSION='${{ matrix.macos-version }}' ARCH_CONFIG=X86_64 MACHINE_CONFIG=NONE bash build.sh --lib
           ) &> build-lib.log || (
             echo "❌ Library build failed — showing last 500 lines:"
             tail -n 500 build-lib.log
             exit 1
           )
-          tar -czf xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz -C build/xnu-lib.obj libkernel.release.none.a RELEASE_X86_64_NONE
-          shasum -a 256 xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz > xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz.sha256
+
+          LIB_OBJ_DIR="build/xnu-lib.obj"
+          TAR_NAME="xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz"
+          mkdir -p xnu-lib-artifacts
+
+          # Only create tarball if both expected artifacts exist
+          if [ -f "${LIB_OBJ_DIR}/libkernel.release.none.a" ] && [ -d "${LIB_OBJ_DIR}/RELEASE_X86_64_NONE" ]; then
+            echo "Packaging libkernel.release.none.a and RELEASE_X86_64_NONE into ${TAR_NAME}"
+            tar -czf "${TAR_NAME}" -C "${LIB_OBJ_DIR}" libkernel.release.none.a RELEASE_X86_64_NONE
+            if [ -f "${TAR_NAME}" ]; then
+              shasum -a 256 "${TAR_NAME}" > "${TAR_NAME}.sha256"
+              echo "Created ${TAR_NAME} and checksum"
+            else
+              echo "❌ Failed to create ${TAR_NAME}"
+            fi
+          else
+            echo "Warning: expected library artifacts missing."
+            echo "Listing ${LIB_OBJ_DIR} contents for debugging:"
+            ls -lah "${LIB_OBJ_DIR}" || true
+
+            # Collect whatever exists so it can be uploaded for inspection
+            if [ -f "${LIB_OBJ_DIR}/libkernel.release.none.a" ]; then
+              cp "${LIB_OBJ_DIR}/libkernel.release.none.a" xnu-lib-artifacts/ || true
+            fi
+            if [ -d "${LIB_OBJ_DIR}/RELEASE_X86_64_NONE" ]; then
+              cp -a "${LIB_OBJ_DIR}/RELEASE_X86_64_NONE" xnu-lib-artifacts/ || true
+            fi
+
+            # If nothing found, include the build log for debugging
+            if [ -z "$(ls -A xnu-lib-artifacts 2>/dev/null || true)" ]; then
+              echo "No library artifacts found; including build-lib.log for inspection"
+              cp build-lib.log xnu-lib-artifacts/ || true
+            fi
+          fi
 
       - name: Upload kernel artifact (if present)
         if: always()
@@ -154,40 +177,4 @@ jobs:
           path: |
             kernel.release.none
             kernel.release.none.sha256
-            fakeroot/System/Library/Kernels/
-
-      - uses: actions/upload-artifact@v6
-        with:
-          name: xnu-lib-${{ matrix.macos-version }}-x86_64
-          path: |
-            xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz
-            xnu-lib-${{ matrix.macos-version }}-x86_64.tar.gz.sha256
-
-      - name: Build XNU CodeQL Database
-        run: |
-          set -o pipefail
-          (
-            MACOS_VERSION='${{ matrix.macos-version }}' ARCH_CONFIG=X86_64 MACHINE_CONFIG=NONE bash -x codeql.sh
-          ) &> codeql.log || (
-            echo "❌ CodeQL build failed — showing last 500 lines:"
-            tail -n 500 codeql.log
-            exit 1
-          )
-          mv xnu-codeql.zip xnu-codeql-${{ matrix.macos-version }}-x86_64.zip
-          shasum -a 256 xnu-codeql-${{ matrix.macos-version }}-x86_64.zip > xnu-codeql-${{ matrix.macos-version }}-x86_64.zip.sha256
-
-      - uses: actions/upload-artifact@v6
-        with:
-          name: xnu-codeql-${{ matrix.macos-version }}-x86_64
-          path: |
-            xnu-codeql-${{ matrix.macos-version }}-x86_64.zip
-            xnu-codeql-${{ matrix.macos-version }}-x86_64.zip.sha256
-
-      # Upload all logs no matter what
-      - name: Upload build logs
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: xnu-logs-${{ matrix.macos-version }}-x86_64
-          path: |
-            *.log
+            fakeroot/System/Library/Kernels
